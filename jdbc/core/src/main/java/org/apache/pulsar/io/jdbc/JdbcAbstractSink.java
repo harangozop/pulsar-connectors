@@ -24,6 +24,7 @@ import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Deque;
 import java.util.HashMap;
@@ -32,6 +33,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
@@ -76,7 +78,7 @@ public abstract class JdbcAbstractSink<T> implements Sink<T> {
     protected JdbcUtils.TableDefinition tableDefinition;
 
     // for flush
-    private Deque<Record<T>> incomingList;
+    private LinkedBlockingDeque<Record<T>> incomingList;
     private AtomicBoolean isFlushing;
     private int batchSize;
     private int maxQueueSize;
@@ -84,7 +86,6 @@ public abstract class JdbcAbstractSink<T> implements Sink<T> {
     private ScheduledFuture<?> scheduledFlushTask;
     private SinkContext sinkContext;
     private Properties connectionProperties;
-    private volatile boolean queueFullLogged = false;
     private final AtomicReference<State> state = new AtomicReference<>(State.OPEN);
 
     @Override
@@ -127,7 +128,11 @@ public abstract class JdbcAbstractSink<T> implements Sink<T> {
         }
         // maxQueueSize < 0 (i.e. -1) means unbounded (legacy behavior)
         log.info("JDBC sink queue capacity: {}", maxQueueSize > 0 ? maxQueueSize : "unbounded");
-        incomingList = new LinkedList<>();
+        if (maxQueueSize > 0) {
+            incomingList = new LinkedBlockingDeque<>(maxQueueSize);
+        } else {
+            incomingList = new LinkedBlockingDeque<>();
+        }
         isFlushing = new AtomicBoolean(false);
 
         flushExecutor = Executors.newScheduledThreadPool(1);
@@ -172,6 +177,10 @@ public abstract class JdbcAbstractSink<T> implements Sink<T> {
     @Override
     public void close() throws Exception {
         state.set(State.CLOSED);
+        // Fail any records still in the queue
+        List<Record<T>> remaining = new ArrayList<>();
+        incomingList.drainTo(remaining);
+        remaining.forEach(Record::fail);
         if (scheduledFlushTask != null) {
             scheduledFlushTask.cancel(false);
             scheduledFlushTask = null;
@@ -211,31 +220,30 @@ public abstract class JdbcAbstractSink<T> implements Sink<T> {
             record.fail();
             return;
         }
-        int number = 0;
-        boolean shouldFail = false;
-        boolean shouldLogQueueFull = false;
-        int queueSizeSnapshot = 0;
-        synchronized (incomingList) {
-            if (maxQueueSize > 0 && incomingList.size() >= maxQueueSize) {
-                if (!queueFullLogged) {
-                    queueFullLogged = true;
-                    shouldLogQueueFull = true;
-                    queueSizeSnapshot = incomingList.size();
-                }
-                shouldFail = true;
-            } else {
-                incomingList.add(record);
-                number = incomingList.size();
-            }
+
+        // Block until space is available or timeout expires.
+        // Blocking the Pulsar IO thread IS the back-pressure: it stops
+        // message consumption for this sink's subscription.
+        boolean accepted;
+        try {
+            accepted = incomingList.offer(record, 1, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            record.fail();
+            return;
         }
-        if (shouldFail) {
-            if (shouldLogQueueFull) {
-                log.warn("Internal queue is full ({} >= {}), failing records to apply back-pressure",
-                        queueSizeSnapshot, maxQueueSize);
+
+        if (!accepted) {
+            if (state.get() != State.OPEN) {
+                log.warn("Sink became {} while waiting for queue space, failing record", state.get());
+            } else {
+                log.warn("Queue still full after timeout (capacity: {}), failing record", maxQueueSize);
             }
             record.fail();
             return;
         }
+
+        int number = incomingList.size();
         if (batchSize > 0 && number >= batchSize) {
             if (log.isDebugEnabled()) {
                 log.debug("flushing by batches, hit batch size {}", batchSize);
@@ -287,9 +295,7 @@ public abstract class JdbcAbstractSink<T> implements Sink<T> {
         }
         if (!isFlushing.compareAndSet(false, true)) {
             if (log.isDebugEnabled()) {
-                synchronized (incomingList) {
-                    log.debug("Already in flushing state, will not flush, queue size: {}", incomingList.size());
-                }
+                log.debug("Already in flushing state, will not flush, queue size: {}", incomingList.size());
             }
             return;
         }
@@ -301,22 +307,17 @@ public abstract class JdbcAbstractSink<T> implements Sink<T> {
             do {
                 final Deque<Record<T>> swapList = new LinkedList<>();
 
-                synchronized (incomingList) {
-                    if (incomingList.isEmpty()) {
-                        return;
-                    }
-                    if (log.isDebugEnabled()) {
-                        log.debug("Starting flush, queue size: {}", incomingList.size());
-                    }
-                    final int actualBatchSize = batchSize > 0 ? Math.min(incomingList.size(), batchSize) :
-                            incomingList.size();
-
-                    for (int i = 0; i < actualBatchSize; i++) {
-                        swapList.add(incomingList.removeFirst());
-                    }
-                    needAnotherRound = batchSize > 0 && !incomingList.isEmpty()
-                            && incomingList.size() >= batchSize;
+                int drainSize = batchSize > 0 ? batchSize : Integer.MAX_VALUE;
+                incomingList.drainTo(swapList, drainSize);
+                if (swapList.isEmpty()) {
+                    return;
                 }
+                if (log.isDebugEnabled()) {
+                    log.debug("Starting flush, drained {} records, queue remaining: {}",
+                            swapList.size(), incomingList.size());
+                }
+                needAnotherRound = batchSize > 0 && !incomingList.isEmpty()
+                        && incomingList.size() >= batchSize;
                 long start = System.nanoTime();
 
                 int count = 0;
@@ -373,7 +374,6 @@ public abstract class JdbcAbstractSink<T> implements Sink<T> {
                     } else {
                         internalFlush(swapList);
                     }
-                    queueFullLogged = false;
                 } catch (Throwable e) {
                     // Catch Throwable (not just Exception) so an Error such as StackOverflowError
                     // is surfaced to the framework via fatal() and the instance is terminated and
