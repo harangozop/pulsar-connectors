@@ -24,7 +24,6 @@ import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.sql.Statement;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Deque;
 import java.util.HashMap;
@@ -177,10 +176,15 @@ public abstract class JdbcAbstractSink<T> implements Sink<T> {
     @Override
     public void close() throws Exception {
         state.set(State.CLOSED);
-        // Fail any records still in the queue
-        List<Record<T>> remaining = new ArrayList<>();
-        incomingList.drainTo(remaining);
-        remaining.forEach(Record::fail);
+        // Fail any records still in the queue. incomingList is null if open() did not get far
+        // enough to create it. Records are polled one at a time rather than drained into a list
+        // so that a large (or unbounded) queue is not copied during shutdown.
+        if (incomingList != null) {
+            Record<T> remaining;
+            while ((remaining = incomingList.poll()) != null) {
+                remaining.fail();
+            }
+        }
         if (scheduledFlushTask != null) {
             scheduledFlushTask.cancel(false);
             scheduledFlushTask = null;
@@ -240,6 +244,18 @@ public abstract class JdbcAbstractSink<T> implements Sink<T> {
                 log.warn("Queue still full after timeout (capacity: {}), failing record", maxQueueSize);
             }
             record.fail();
+            return;
+        }
+
+        // close() or fatal() may have run while this thread was waiting in offer(). If so, the
+        // queue may never be flushed again, so take the record back and fail it. If remove()
+        // returns false, flush() or close() has already drained the record and owns its ack/fail.
+        State current = state.get();
+        if (current != State.OPEN) {
+            if (incomingList.remove(record)) {
+                log.warn("Sink became {} after record was queued, failing record", current);
+                record.fail();
+            }
             return;
         }
 

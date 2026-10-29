@@ -134,9 +134,10 @@ public class JdbcSinkConfig implements Serializable {
             required = false,
             defaultValue = "-1",
             help = "Maximum number of records to buffer in the internal queue before applying back-pressure. "
-                    + "When the queue is full, incoming records will be failed (negatively acknowledged) so that "
-                    + "the Pulsar consumer can redeliver them later. This prevents out-of-memory errors when the "
-                    + "database connection is slow or broken. "
+                    + "When the queue is full, write() blocks for up to 1 second waiting for space, which pauses "
+                    + "consumption for this sink. If no space frees up in time, the record is failed (negatively "
+                    + "acknowledged) so that the Pulsar consumer can redeliver it later. This prevents "
+                    + "out-of-memory errors when the database connection is slow or broken. "
                     + "A value of 0 auto-sizes to batchSize * 10. "
                     + "A value of -1 (default) disables the limit (unbounded, legacy behavior)."
     )

@@ -28,8 +28,10 @@ import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.withSettings;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Maps;
+import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Deque;
 import java.util.HashMap;
@@ -38,6 +40,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -533,10 +536,8 @@ public class SqliteJdbcSinkTest {
             @SuppressWarnings("unchecked")
             Deque<Record<GenericObject>> incomingList =
                     (Deque<Record<GenericObject>>) FieldUtils.readField(sink, "incomingList", true);
-            synchronized (incomingList) {
-                for (int i = 0; i < recordCount; i++) {
-                    incomingList.add(record);
-                }
+            for (int i = 0; i < recordCount; i++) {
+                incomingList.add(record);
             }
 
             // Nothing else can flush, so this single call must drain the entire backlog
@@ -1085,23 +1086,15 @@ public class SqliteJdbcSinkTest {
     }
 
     /**
-     * Test that the bounded queue applies back-pressure by failing records when full.
+     * Test that the bounded queue applies back-pressure: when the queue is full, write() blocks
+     * waiting for space and fails the record only if none frees up within the offer timeout.
      */
     @Test
     public void testBoundedQueueBackPressure() throws Exception {
         jdbcSink.close();
         jdbcSink = null;
 
-        String jdbcUrl = sqliteUtils.sqliteUri();
-        Map<String, Object> conf = Maps.newHashMap();
-        conf.put("jdbcUrl", jdbcUrl);
-        conf.put("tableName", tableName);
-        conf.put("key", "field3");
-        conf.put("nonKey", "field1,field2");
-        // Large batch size so flush is not triggered by writes
-        conf.put("batchSize", 1000);
-        // No time-based flush
-        conf.put("timeoutMs", 0);
+        Map<String, Object> conf = createNoFlushConfig();
         // Small queue to test back-pressure
         conf.put("maxQueueSize", 5);
 
@@ -1110,22 +1103,156 @@ public class SqliteJdbcSinkTest {
             boundedSink.open(conf, null);
 
             // Fill the queue to capacity
-            List<CompletableFuture<Boolean>> futures = new java.util.ArrayList<>();
+            List<CompletableFuture<Boolean>> futures = new ArrayList<>();
             for (int i = 0; i < 5; i++) {
                 CompletableFuture<Boolean> f = new CompletableFuture<>();
                 futures.add(f);
                 boundedSink.write(createMockFooRecord(new Foo("f1", "f2", i + 100), Maps.newHashMap(), f));
             }
 
-            // Next write should be rejected due to queue full
+            // Nothing flushes, so the next write blocks for the offer timeout (1s) and then
+            // fails the overflow record before returning
             CompletableFuture<Boolean> overflowFuture = new CompletableFuture<>();
+            long start = System.nanoTime();
             boundedSink.write(createMockFooRecord(new Foo("overflow", "val", 999), Maps.newHashMap(), overflowFuture));
+            long blockedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
 
-            // The overflow record should be failed immediately
-            Assert.assertFalse(overflowFuture.get(1, TimeUnit.SECONDS));
+            Assert.assertTrue(blockedMs >= 900, "write() should block while the queue is full, blocked "
+                    + blockedMs + " ms");
+            Assert.assertTrue(overflowFuture.isDone());
+            Assert.assertFalse(overflowFuture.get());
+            // The records already in the queue are still pending, not failed
+            for (CompletableFuture<Boolean> f : futures) {
+                Assert.assertFalse(f.isDone());
+            }
         } finally {
             boundedSink.close();
         }
+    }
+
+    /**
+     * Test that close() does not throw when the sink was never opened, or when open() failed
+     * before the internal queue was created. Pulsar IO calls close() after a failed open(), and
+     * throwing there would hide the original failure and skip the remaining cleanup.
+     */
+    @Test
+    public void testCloseWithoutSuccessfulOpen() throws Exception {
+        jdbcSink.close();
+        jdbcSink = null;
+
+        new SqliteJdbcAutoSchemaSink().close();
+
+        // open() fails after the connection is opened (unknown table), before the queue exists
+        Map<String, Object> conf = Maps.newHashMap();
+        conf.put("jdbcUrl", sqliteUtils.sqliteUri());
+        conf.put("tableName", "no_such_table");
+        conf.put("key", "field3");
+        conf.put("nonKey", "field1,field2");
+        conf.put("batchSize", 1);
+        SqliteJdbcAutoSchemaSink failedSink = new SqliteJdbcAutoSchemaSink();
+        Assert.assertThrows(Exception.class, () -> failedSink.open(conf, null));
+        Connection connection = failedSink.getConnection();
+        Assert.assertNotNull(connection);
+
+        failedSink.close();
+        Assert.assertTrue(connection.isClosed());
+    }
+
+    /**
+     * Test that close() fails the records still sitting in the queue instead of leaving them
+     * neither acked nor failed.
+     */
+    @Test
+    @SuppressWarnings("unchecked")
+    public void testCloseFailsQueuedRecords() throws Exception {
+        jdbcSink.close();
+        jdbcSink = null;
+
+        List<Record<GenericObject>> records = new ArrayList<>();
+        SqliteJdbcAutoSchemaSink sink = new SqliteJdbcAutoSchemaSink();
+        try {
+            sink.open(createNoFlushConfig(), null);
+            for (int i = 0; i < 3; i++) {
+                Record<GenericObject> record = mock(Record.class);
+                records.add(record);
+                sink.write(record);
+            }
+            // Nothing flushes, so every record is still queued and pending
+            for (Record<GenericObject> record : records) {
+                verify(record, never()).fail();
+                verify(record, never()).ack();
+            }
+        } finally {
+            sink.close();
+        }
+
+        for (Record<GenericObject> record : records) {
+            verify(record).fail();
+            verify(record, never()).ack();
+        }
+        Assert.assertTrue(getIncomingList(sink).isEmpty());
+    }
+
+    /**
+     * Test the race where close() completes while write() is between its initial state check and
+     * the enqueue (e.g. blocked in offer() on a full queue, woken by close() draining it). The
+     * record lands in a queue that close() has already drained, so write() must take it back and
+     * fail it instead of leaving it neither acked nor failed.
+     */
+    @Test
+    @SuppressWarnings("unchecked")
+    public void testWriteFailsRecordQueuedAfterClose() throws Exception {
+        jdbcSink.close();
+        jdbcSink = null;
+
+        SqliteJdbcAutoSchemaSink sink = new SqliteJdbcAutoSchemaSink();
+        try {
+            sink.open(createNoFlushConfig(), null);
+            LinkedBlockingDeque<Record<GenericObject>> racingQueue = new LinkedBlockingDeque<>() {
+                @Override
+                public boolean offer(Record<GenericObject> e, long timeout, TimeUnit unit)
+                        throws InterruptedException {
+                    try {
+                        sink.close();
+                    } catch (Exception ex) {
+                        throw new IllegalStateException(ex);
+                    }
+                    return super.offer(e, timeout, unit);
+                }
+            };
+            FieldUtils.writeField(sink, "incomingList", racingQueue, true);
+
+            Record<GenericObject> record = mock(Record.class);
+            sink.write(record);
+
+            verify(record).fail();
+            verify(record, never()).ack();
+            Assert.assertTrue(racingQueue.isEmpty());
+        } finally {
+            sink.close();
+        }
+    }
+
+    /**
+     * Config with a batch size that is never reached and no time-based flush, so written records
+     * stay in the queue until the sink is closed.
+     */
+    private Map<String, Object> createNoFlushConfig() {
+        Map<String, Object> conf = Maps.newHashMap();
+        conf.put("jdbcUrl", sqliteUtils.sqliteUri());
+        conf.put("tableName", tableName);
+        conf.put("key", "field3");
+        conf.put("nonKey", "field1,field2");
+        conf.put("batchSize", 1000);
+        conf.put("timeoutMs", 0);
+        configure(conf);
+        return conf;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Deque<Record<GenericObject>> getIncomingList(JdbcAbstractSink<GenericObject> sink)
+            throws IllegalAccessException {
+        return (Deque<Record<GenericObject>>) FieldUtils.readField(sink, "incomingList", true);
     }
 
     @Test(expectedExceptions = IllegalArgumentException.class,
