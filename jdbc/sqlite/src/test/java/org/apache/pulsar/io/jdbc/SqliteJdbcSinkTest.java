@@ -23,6 +23,7 @@ import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.withSettings;
@@ -41,6 +42,7 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingDeque;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -1228,6 +1230,151 @@ public class SqliteJdbcSinkTest {
             verify(record).fail();
             verify(record, never()).ack();
             Assert.assertTrue(racingQueue.isEmpty());
+        } finally {
+            sink.close();
+        }
+    }
+
+    /**
+     * Test the other side of the post-offer race: close() runs after offer() accepted the record
+     * but before write() re-checks the state, so close() has already drained and failed it.
+     * write() then finds the record gone (remove() returns false) and must not fail it again.
+     */
+    @Test
+    @SuppressWarnings("unchecked")
+    public void testWriteDoesNotFailRecordDrainedByClose() throws Exception {
+        jdbcSink.close();
+        jdbcSink = null;
+
+        SqliteJdbcAutoSchemaSink sink = new SqliteJdbcAutoSchemaSink();
+        try {
+            sink.open(createNoFlushConfig(), null);
+            LinkedBlockingDeque<Record<GenericObject>> racingQueue = new LinkedBlockingDeque<>() {
+                @Override
+                public boolean offer(Record<GenericObject> e, long timeout, TimeUnit unit)
+                        throws InterruptedException {
+                    boolean accepted = super.offer(e, timeout, unit);
+                    try {
+                        sink.close();
+                    } catch (Exception ex) {
+                        throw new IllegalStateException(ex);
+                    }
+                    return accepted;
+                }
+            };
+            FieldUtils.writeField(sink, "incomingList", racingQueue, true);
+
+            Record<GenericObject> record = mock(Record.class);
+            sink.write(record);
+
+            // Failed exactly once, by close()
+            verify(record, times(1)).fail();
+            verify(record, never()).ack();
+            Assert.assertTrue(racingQueue.isEmpty());
+        } finally {
+            sink.close();
+        }
+    }
+
+    /**
+     * Test that close() still completes when Record.fail() throws for a queued record, as the
+     * Pulsar source's fail function does under EFFECTIVELY_ONCE. The other queued records must
+     * still be failed, and the flush executor and the connection must still be shut down.
+     */
+    @Test(dataProvider = "useTransactions")
+    @SuppressWarnings("unchecked")
+    public void testCloseContinuesWhenRecordFailThrows(boolean useTransactions) throws Exception {
+        jdbcSink.close();
+        jdbcSink = null;
+
+        Map<String, Object> conf = createNoFlushConfig();
+        conf.put("useTransactions", useTransactions);
+        Record<GenericObject> throwingRecord = mock(Record.class);
+        doThrow(new RuntimeException("Simulated fail() failure")).when(throwingRecord).fail();
+        Record<GenericObject> record = mock(Record.class);
+        Connection connection;
+        ScheduledExecutorService flushExecutor;
+        SqliteJdbcAutoSchemaSink sink = new SqliteJdbcAutoSchemaSink();
+        try {
+            sink.open(conf, null);
+            connection = sink.getConnection();
+            flushExecutor = (ScheduledExecutorService) FieldUtils.readField(sink, "flushExecutor", true);
+            // The throwing record is queued first, so it is failed first
+            sink.write(throwingRecord);
+            sink.write(record);
+
+            // Must not throw
+            sink.close();
+        } finally {
+            sink.close();
+        }
+
+        verify(throwingRecord).fail();
+        verify(throwingRecord, never()).ack();
+        verify(record).fail();
+        verify(record, never()).ack();
+        Assert.assertTrue(getIncomingList(sink).isEmpty());
+        Assert.assertTrue(flushExecutor.isShutdown());
+        Assert.assertTrue(connection.isClosed());
+    }
+
+    /**
+     * Test that a write() blocked on a full queue is accepted, not failed, once space frees up
+     * (as when flush() drains a batch). This test does not depend on how long write() is willing
+     * to wait; {@link #testBoundedQueueBackPressure()} covers what happens when no space frees up.
+     */
+    @Test
+    @SuppressWarnings("unchecked")
+    public void testBlockedWriteAcceptedWhenQueueSpaceFreed() throws Exception {
+        jdbcSink.close();
+        jdbcSink = null;
+
+        Map<String, Object> conf = createNoFlushConfig();
+        conf.put("maxQueueSize", 2);
+        SqliteJdbcAutoSchemaSink sink = new SqliteJdbcAutoSchemaSink();
+        try {
+            sink.open(conf, null);
+            Deque<Record<GenericObject>> queue = getIncomingList(sink);
+            Record<GenericObject> first = mock(Record.class);
+            Record<GenericObject> second = mock(Record.class);
+            Record<GenericObject> blocked = mock(Record.class);
+            sink.write(first);
+            sink.write(second);
+
+            // Free one slot (as flush() would) once this writer thread is parked. WAITING and
+            // TIMED_WAITING both count as parked, so the test stays valid if write() later waits
+            // without a timeout. A 1 ms polling loop is used instead of Awaitility, whose first use
+            // in a JVM adds class loading and an extra thread between the writer parking and the
+            // slot being freed. The slot is freed within about a millisecond of the writer parking
+            // (under 1 ms locally), three orders of magnitude below the current 1s offer timeout,
+            // so a slow CI machine has a wide margin. The slot is freed in finally so a failed
+            // check never leaves the writer blocked.
+            Thread writer = Thread.currentThread();
+            CompletableFuture<Boolean> blockedInWrite = new CompletableFuture<>();
+            Thread releaser = new Thread(() -> {
+                try {
+                    while (writer.getState() != Thread.State.TIMED_WAITING
+                            && writer.getState() != Thread.State.WAITING) {
+                        Thread.sleep(1);
+                    }
+                    blockedInWrite.complete(queue.size() == 2 && Arrays.stream(writer.getStackTrace())
+                            .anyMatch(frame -> frame.getClassName().equals(JdbcAbstractSink.class.getName())
+                                    && frame.getMethodName().equals("write")));
+                } catch (Throwable t) {
+                    blockedInWrite.completeExceptionally(t);
+                } finally {
+                    queue.pollFirst();
+                }
+            }, "free-queue-slot");
+            releaser.setDaemon(true);
+            releaser.start();
+            sink.write(blocked);
+
+            Assert.assertTrue(blockedInWrite.get(10, TimeUnit.SECONDS),
+                    "write() should have been blocked on the full queue when the slot was freed");
+            verify(blocked, never()).fail();
+            verify(blocked, never()).ack();
+            Assert.assertEquals(new ArrayList<>(queue), Arrays.asList(second, blocked));
         } finally {
             sink.close();
         }

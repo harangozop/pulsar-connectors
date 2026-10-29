@@ -179,10 +179,25 @@ public abstract class JdbcAbstractSink<T> implements Sink<T> {
         // Fail any records still in the queue. incomingList is null if open() did not get far
         // enough to create it. Records are polled one at a time rather than drained into a list
         // so that a large (or unbounded) queue is not copied during shutdown.
+        // Record.fail() may throw (the Pulsar source's fail function always throws under
+        // EFFECTIVELY_ONCE). Keep draining and finish the cleanup below; log once at the end.
         if (incomingList != null) {
             Record<T> remaining;
+            int failErrors = 0;
+            RuntimeException firstFailError = null;
             while ((remaining = incomingList.poll()) != null) {
-                remaining.fail();
+                try {
+                    remaining.fail();
+                } catch (RuntimeException e) {
+                    if (firstFailError == null) {
+                        firstFailError = e;
+                    }
+                    failErrors++;
+                }
+            }
+            if (firstFailError != null) {
+                log.warn("Record.fail() threw for {} queued record(s) while closing the sink",
+                        failErrors, firstFailError);
             }
         }
         if (scheduledFlushTask != null) {
