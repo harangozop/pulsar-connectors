@@ -19,9 +19,13 @@
 package org.apache.pulsar.io.jdbc;
 
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.util.ArrayList;
@@ -32,10 +36,12 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.apache.commons.lang3.reflect.FieldUtils;
 import org.apache.pulsar.client.api.schema.GenericObject;
 import org.apache.pulsar.functions.api.Record;
@@ -44,6 +50,7 @@ import org.apache.pulsar.io.jdbc.SqliteJdbcSinkTest.Foo;
 import org.testng.Assert;
 import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeMethod;
+import org.testng.annotations.DataProvider;
 import org.testng.annotations.Test;
 
 /**
@@ -78,6 +85,129 @@ public class SqliteJdbcSinkQueueTest {
     }
 
     /**
+     * Test that a full queue applies back-pressure by blocking write(), not by failing records:
+     * while a flush is stuck, write() keeps waiting well past the offer interval, and its record is
+     * accepted once the flush completes and the next one frees up space.
+     */
+    @Test
+    public void testBoundedQueueBackPressure() throws Exception {
+        final int capacity = 5;
+        openSink(createConfig(capacity, capacity), null);
+        blockFlushes(0);
+        List<CompletableFuture<Boolean>> results = new ArrayList<>();
+        List<Record<GenericObject>> records = createRecords(2 * capacity + 1, results);
+        Record<GenericObject> blocked = records.get(2 * capacity);
+
+        // The first batch is drained by a flush that gets stuck, the second batch fills the queue
+        for (int i = 0; i < 2 * capacity; i++) {
+            sink.write(records.get(i));
+            if (i == capacity - 1) {
+                Assert.assertTrue(flushBlocked.await(10, TimeUnit.SECONDS));
+            }
+        }
+        Assert.assertEquals(queue().size(), capacity);
+        CompletableFuture<Boolean> writeDone = new CompletableFuture<>();
+        awaitBlockedInWrite(startWriter(blocked, writeDone));
+
+        // Well past the 1 s offer interval, after which write() used to fail the record
+        Thread.sleep(1500);
+        Assert.assertFalse(writeDone.isDone(), "write() should still be blocked on the full queue");
+        Assert.assertTrue(results.stream().noneMatch(CompletableFuture::isDone));
+
+        // The stuck flush completes, and the next one frees up space
+        releaseFlush.countDown();
+        writeDone.get(10, TimeUnit.SECONDS);
+        for (int i = 0; i < 2 * capacity; i++) {
+            Assert.assertTrue(results.get(i).get(10, TimeUnit.SECONDS));
+        }
+        // Accepted: still queued, or written by a flush that the waiting write() scheduled
+        awaitScheduledFlushes();
+        Assert.assertTrue(queue().contains(blocked) || results.get(2 * capacity).getNow(false));
+    }
+
+    /**
+     * Test that a write() blocked on a full queue schedules a flush after one offer interval when
+     * no flush is due (only a time-based flush, with an interval far longer than the test).
+     */
+    @Test
+    public void testBlockedWriteSchedulesFlush() throws Exception {
+        Map<String, Object> conf = createConfig(0, 2);
+        conf.put("timeoutMs", (int) TimeUnit.MINUTES.toMillis(10));
+        openSink(conf, null);
+        List<CompletableFuture<Boolean>> results = new ArrayList<>();
+        List<Record<GenericObject>> records = createRecords(3, results);
+        sink.write(records.get(0));
+        sink.write(records.get(1));
+
+        CompletableFuture<Boolean> writeDone = new CompletableFuture<>();
+        long start = System.nanoTime();
+        startWriter(records.get(2), writeDone);
+        writeDone.get(10, TimeUnit.SECONDS);
+        long blockedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+
+        Assert.assertTrue(blockedMs >= 900, "write() returned after " + blockedMs + " ms");
+        Assert.assertTrue(results.get(0).get(10, TimeUnit.SECONDS));
+        Assert.assertTrue(results.get(1).get(10, TimeUnit.SECONDS));
+        Assert.assertEquals(new ArrayList<>(queue()), records.subList(2, 3));
+        Assert.assertFalse(results.get(2).isDone());
+    }
+
+    @DataProvider(name = "interruptOnFatal")
+    public Object[] interruptOnFatal() {
+        return new Object[] {false, true};
+    }
+
+    /**
+     * Test that a write() blocked on a full queue fails its record and returns when a flush fails
+     * and calls fatal(), as nothing frees up space after that. The Pulsar instance interrupts the
+     * instance thread after fatal(), which wakes write() at once. Without an interrupt, write()
+     * notices the FAILED state within one offer interval.
+     */
+    @Test(dataProvider = "interruptOnFatal")
+    public void testBlockedWriteFailsWhenFlushFailsFatally(boolean interruptOnFatal) throws Exception {
+        SinkContext sinkContext = mock(SinkContext.class);
+        AtomicReference<Thread> writer = new AtomicReference<>();
+        CompletableFuture<Long> fatalNanos = new CompletableFuture<>();
+        doAnswer(invocation -> {
+            fatalNanos.complete(System.nanoTime());
+            if (interruptOnFatal) {
+                writer.get().interrupt();
+            }
+            return null;
+        }).when(sinkContext).fatal(any(Throwable.class));
+        openSink(createConfig(2, 2), sinkContext);
+        blockFlushes(1);
+        List<CompletableFuture<Boolean>> results = new ArrayList<>();
+        List<Record<GenericObject>> records = createRecords(5, results);
+
+        // A full batch starts a flush that gets stuck. Fill the queue directly, so that no other
+        // flush is scheduled.
+        sink.write(records.get(0));
+        sink.write(records.get(1));
+        Assert.assertTrue(flushBlocked.await(10, TimeUnit.SECONDS));
+        queue().addAll(records.subList(2, 4));
+        CompletableFuture<Boolean> interruptedAfterWrite = new CompletableFuture<>();
+        writer.set(startWriter(records.get(4), interruptedAfterWrite));
+        awaitBlockedInWrite(writer.get());
+
+        releaseFlush.countDown();
+        long fatalAt = fatalNanos.get(10, TimeUnit.SECONDS);
+        boolean interrupted = interruptedAfterWrite.get(10, TimeUnit.SECONDS);
+        long exitMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - fatalAt);
+
+        Assert.assertEquals(FieldUtils.readField(sink, "state", true).toString(), "FAILED");
+        Assert.assertFalse(results.get(4).get(1, TimeUnit.SECONDS));
+        Assert.assertEquals(interrupted, interruptOnFatal, "The interrupt flag should be restored");
+        // The interrupt wakes write() without waiting for the end of the 1 s offer interval
+        Assert.assertTrue(exitMs < (interruptOnFatal ? 500 : 3000), "write() returned after " + exitMs + " ms");
+        // The failed batch is failed, the queued records are left for close()
+        Assert.assertFalse(results.get(0).get(1, TimeUnit.SECONDS));
+        Assert.assertFalse(results.get(1).get(1, TimeUnit.SECONDS));
+        Assert.assertEquals(new ArrayList<>(queue()), records.subList(2, 4));
+        Assert.assertFalse(results.get(2).isDone() || results.get(3).isDone());
+    }
+
+    /**
      * Test that a flush scheduled before another flush fails does not run once the sink is FAILED.
      * It would ack records newer than the failed batch, which the redelivered older records could
      * then overwrite (e.g. in UPSERT mode).
@@ -105,6 +235,142 @@ public class SqliteJdbcSinkQueueTest {
         Assert.assertFalse(results.get(1).get(1, TimeUnit.SECONDS));
         Assert.assertEquals(new ArrayList<>(queue()), records.subList(2, 4), "A flush ran after fatal()");
         Assert.assertFalse(results.get(2).isDone() || results.get(3).isDone());
+    }
+
+    @Test(expectedExceptions = IllegalArgumentException.class,
+          expectedExceptionsMessageRegExp = ".*maxQueueSize.*batchSize.*")
+    public void testMaxQueueSizeSmallerThanBatchSizeRejected() throws Exception {
+        openSink(createConfig(200, 199), null);
+    }
+
+    /**
+     * Test that close() does not throw when the sink was never opened, or when open() failed
+     * before the queue was created. Pulsar IO calls close() after a failed open().
+     */
+    @Test
+    public void testCloseWithoutSuccessfulOpen() throws Exception {
+        new SqliteJdbcAutoSchemaSink().close();
+
+        // open() fails after the connection is opened (unknown table), before the queue exists
+        Map<String, Object> conf = createConfig(1, -1);
+        conf.put("tableName", "no_such_table");
+        sink = new SqliteJdbcAutoSchemaSink();
+        Assert.assertThrows(Exception.class, () -> sink.open(conf, null));
+        Connection connection = sink.getConnection();
+        Assert.assertNotNull(connection);
+        sink.close();
+        Assert.assertTrue(connection.isClosed());
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    public void testCloseFailsQueuedRecords() throws Exception {
+        openSink(createConfig(1000, -1), null);
+        List<Record<GenericObject>> records = new ArrayList<>();
+        for (int i = 0; i < 3; i++) {
+            records.add(mock(Record.class));
+            sink.write(records.get(i));
+            verify(records.get(i), never()).fail();
+        }
+
+        sink.close();
+        for (Record<GenericObject> record : records) {
+            verify(record).fail();
+            verify(record, never()).ack();
+        }
+        Assert.assertTrue(queue().isEmpty());
+    }
+
+    @DataProvider(name = "useTransactions")
+    public Object[] useTransactions() {
+        return new Object[] {true, false};
+    }
+
+    /**
+     * Test that close() still fails the other queued records and shuts everything down when
+     * Record.fail() throws, as the Pulsar source's fail function does under EFFECTIVELY_ONCE.
+     */
+    @Test(dataProvider = "useTransactions")
+    @SuppressWarnings("unchecked")
+    public void testCloseContinuesWhenRecordFailThrows(boolean useTransactions) throws Exception {
+        Map<String, Object> conf = createConfig(1000, -1);
+        conf.put("useTransactions", useTransactions);
+        openSink(conf, null);
+        Connection connection = sink.getConnection();
+        ScheduledExecutorService flushExecutor =
+                (ScheduledExecutorService) FieldUtils.readField(sink, "flushExecutor", true);
+        Record<GenericObject> throwingRecord = mock(Record.class);
+        doThrow(new RuntimeException("Simulated fail() failure")).when(throwingRecord).fail();
+        Record<GenericObject> record = mock(Record.class);
+        // The throwing record is queued first, so it is failed first
+        sink.write(throwingRecord);
+        sink.write(record);
+
+        sink.close();
+
+        verify(throwingRecord).fail();
+        verify(record).fail();
+        Assert.assertTrue(queue().isEmpty());
+        Assert.assertTrue(flushExecutor.isShutdown());
+        Assert.assertTrue(connection.isClosed());
+    }
+
+    private enum CloseRace {
+        // close() drains the queue while write() waits in offer(): write() must take the record back
+        BEFORE_OFFER,
+        // close() drains and fails the record after offer() accepted it: write() must leave it alone
+        AFTER_OFFER,
+        // close() shuts the flush executor down right before write() schedules a flush
+        BEFORE_FLUSH_SCHEDULED
+    }
+
+    @DataProvider(name = "closeRaces")
+    public Object[] closeRaces() {
+        return CloseRace.values();
+    }
+
+    /**
+     * Test that a record is failed exactly once, and write() does not throw, when close() runs at
+     * different points of a write(). close() is called from the queue methods that write() calls.
+     */
+    @Test(dataProvider = "closeRaces")
+    @SuppressWarnings("unchecked")
+    public void testCloseRacesWrite(CloseRace race) throws Exception {
+        openSink(createConfig(1, -1), null);
+        FieldUtils.writeField(sink, "incomingList", new LinkedBlockingDeque<Record<GenericObject>>() {
+            @Override
+            public boolean offer(Record<GenericObject> e, long timeout, TimeUnit unit)
+                    throws InterruptedException {
+                closeIf(race == CloseRace.BEFORE_OFFER);
+                boolean accepted = super.offer(e, timeout, unit);
+                closeIf(race == CloseRace.AFTER_OFFER);
+                return accepted;
+            }
+
+            @Override
+            public int size() {
+                int size = super.size();
+                closeIf(race == CloseRace.BEFORE_FLUSH_SCHEDULED);
+                return size;
+            }
+
+            private void closeIf(boolean condition) {
+                if (condition) {
+                    try {
+                        sink.close();
+                    } catch (Exception ex) {
+                        throw new IllegalStateException(ex);
+                    }
+                }
+            }
+        }, true);
+
+        Record<GenericObject> record = mock(Record.class);
+        sink.write(record);
+
+        verify(record).fail();
+        verify(record, never()).ack();
+        Assert.assertTrue(queue().isEmpty());
     }
 
     /**
@@ -172,5 +438,37 @@ public class SqliteJdbcSinkQueueTest {
             records.add(SqliteJdbcSinkTest.createMockFooRecord(new Foo("f" + i, "f2", i), new HashMap<>(), result));
         }
         return records;
+    }
+
+    /**
+     * Call write() on a new thread. {@code done} completes when write() returns, with whether the
+     * thread's interrupt flag is set at that point.
+     */
+    private Thread startWriter(Record<GenericObject> record, CompletableFuture<Boolean> done) {
+        Thread writer = new Thread(() -> {
+            try {
+                sink.write(record);
+                done.complete(Thread.currentThread().isInterrupted());
+            } catch (Throwable t) {
+                done.completeExceptionally(t);
+            }
+        }, "blocked-writer");
+        writer.setDaemon(true);
+        writer.start();
+        return writer;
+    }
+
+    /**
+     * Wait until {@code writer} waits for queue space in write(), the only timed wait there. Polls
+     * every millisecond so that the wait is noticed long before the offer interval ends.
+     */
+    private static void awaitBlockedInWrite(Thread writer) throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (writer.getState() != Thread.State.TIMED_WAITING) {
+            if (System.nanoTime() > deadline) {
+                throw new TimeoutException("write() did not block, writer state: " + writer.getState());
+            }
+            Thread.sleep(1);
+        }
     }
 }

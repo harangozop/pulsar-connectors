@@ -134,10 +134,13 @@ public class JdbcSinkConfig implements Serializable {
             required = false,
             defaultValue = "-1",
             help = "Maximum number of records to buffer in the internal queue before applying back-pressure. "
-                    + "When the queue is full, write() blocks for up to 1 second waiting for space, which pauses "
-                    + "consumption for this sink. If no space frees up in time, the record is failed (negatively "
-                    + "acknowledged) so that the Pulsar consumer can redeliver it later. This prevents "
-                    + "out-of-memory errors when the database connection is slow or broken. "
+                    + "When the queue is full, write() blocks until a flush frees up space, which pauses "
+                    + "consumption for this sink. This prevents out-of-memory errors when the database "
+                    + "connection is slow or broken. A blocked write() fails (negatively acknowledges) its "
+                    + "record only if the sink fails or is closed, or the instance is stopped. If the database "
+                    + "hangs without failing the connection, writes block until it responds, so configure "
+                    + "socket or query timeouts in jdbcUrl (e.g. socketTimeout for PostgreSQL or MariaDB). "
+                    + "When both are positive, maxQueueSize must be greater than or equal to batchSize. "
                     + "A value of 0 auto-sizes to batchSize * 10. "
                     + "A value of -1 (default) disables the limit (unbounded, legacy behavior)."
     )
@@ -171,6 +174,11 @@ public class JdbcSinkConfig implements Serializable {
         if (maxQueueSize < -1) {
             throw new IllegalArgumentException("maxQueueSize must be -1 (unbounded), 0 (auto-size), "
                     + "or a positive value.");
+        }
+        if (maxQueueSize > 0 && batchSize > 0 && maxQueueSize < batchSize) {
+            throw new IllegalArgumentException("maxQueueSize (" + maxQueueSize + ") must be greater than or "
+                    + "equal to batchSize (" + batchSize + "), otherwise the queue fills up before a batch is "
+                    + "complete and batchSize never triggers a flush.");
         }
     }
 
