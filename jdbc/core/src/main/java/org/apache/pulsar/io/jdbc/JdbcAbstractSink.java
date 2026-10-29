@@ -321,7 +321,10 @@ public abstract class JdbcAbstractSink<T> implements Sink<T> {
 
 
     private void flush() {
-        if (state.get() == State.CLOSED) {
+        // Do not flush once the sink has failed, e.g. a flush queued before an earlier one failed:
+        // it would ack records newer than the failed batch, which is redelivered and could then
+        // overwrite them. The records stay queued and close() fails them.
+        if (state.get() != State.OPEN) {
             return;
         }
         if (!isFlushing.compareAndSet(false, true)) {

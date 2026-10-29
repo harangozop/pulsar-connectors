@@ -1475,8 +1475,8 @@ public class SqliteJdbcSinkTest {
     }
 
     @SuppressWarnings("unchecked")
-    private Record<GenericObject> createMockFooRecord(Foo record, Map<String, String> actionProperties,
-                                                        CompletableFuture<Boolean> future) {
+    static Record<GenericObject> createMockFooRecord(Foo record, Map<String, String> actionProperties,
+                                                       CompletableFuture<Boolean> future) {
         Message<GenericRecord> insertMessage = mock(MessageImpl.class);
         GenericSchema<GenericRecord> genericAvroSchema;
         AvroSchema<Foo> schema = AvroSchema.of(SchemaDefinition.<Foo>builder()
