@@ -31,6 +31,7 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Queue;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.RejectedExecutionException;
@@ -152,7 +153,7 @@ public abstract class JdbcAbstractSink<T> implements Sink<T> {
         flushExecutor = Executors.newScheduledThreadPool(1);
         if (timeoutMs > 0) {
             scheduledFlushTask = flushExecutor.scheduleAtFixedRate(
-                    this::flush, timeoutMs, timeoutMs, TimeUnit.MILLISECONDS);
+                    this::flushOrFatal, timeoutMs, timeoutMs, TimeUnit.MILLISECONDS);
         }
     }
 
@@ -194,26 +195,9 @@ public abstract class JdbcAbstractSink<T> implements Sink<T> {
         // Fail any records still in the queue. incomingList is null if open() did not get far
         // enough to create it. Records are polled one at a time rather than drained into a list
         // so that a large (or unbounded) queue is not copied during shutdown.
-        // Record.fail() may throw (the Pulsar source's fail function always throws under
-        // EFFECTIVELY_ONCE). Keep draining and finish the cleanup below; log once at the end.
+        // failRecords() keeps going when Record.fail() throws, so the cleanup below always runs.
         if (incomingList != null) {
-            Record<T> remaining;
-            int failErrors = 0;
-            RuntimeException firstFailError = null;
-            while ((remaining = incomingList.poll()) != null) {
-                try {
-                    remaining.fail();
-                } catch (RuntimeException e) {
-                    if (firstFailError == null) {
-                        firstFailError = e;
-                    }
-                    failErrors++;
-                }
-            }
-            if (firstFailError != null) {
-                log.warn("Record.fail() threw for {} queued record(s) while closing the sink",
-                        failErrors, firstFailError);
-            }
+            failRecords(incomingList, "queued while closing the sink");
         }
         if (scheduledFlushTask != null) {
             scheduledFlushTask.cancel(false);
@@ -348,7 +332,23 @@ public abstract class JdbcAbstractSink<T> implements Sink<T> {
         // new flush instead of relying on this one. The periodic flush leaves the flag alone:
         // clearing it while an on-demand flush is still pending would let write() schedule another.
         flushPending.set(false);
-        flush();
+        flushOrFatal();
+    }
+
+    /**
+     * Run flush() as a task of the flush executor, reporting anything that escapes it through
+     * fatal(). An exception escaping a periodic task cancels it without notice, and the executor
+     * keeps the exception of an on-demand task in a Future that nobody reads. fatal() only acts on
+     * an OPEN sink, so an error that flush() already reported is not reported again, and fatal()
+     * cancelling the periodic task from inside it just stops further runs.
+     */
+    private void flushOrFatal() {
+        try {
+            flush();
+        } catch (Throwable t) {
+            log.error("Flush task failed with {}", t.toString(), t);
+            fatal(t);
+        }
     }
 
     public String generateInsertQueryStatement() {
@@ -489,18 +489,28 @@ public abstract class JdbcAbstractSink<T> implements Sink<T> {
                             TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start),
                             swapList.size(),
                             e);
-                    swapList.forEach(Record::fail);
+                    // A throwing Record.fail() must not skip the other records, the rollback or
+                    // fatal(), otherwise the sink would stay OPEN. failRecords() handles a
+                    // RuntimeException; the finally blocks cover an Error from fail() or rollback().
                     try {
-                        if (jdbcSinkConfig.isUseTransactions()) {
-                            connection.rollback();
+                        failRecords(swapList, "of the failed flush");
+                    } finally {
+                        try {
+                            if (jdbcSinkConfig.isUseTransactions()) {
+                                connection.rollback();
+                            }
+                        } catch (Exception ex) {
+                            log.error("Failed to rollback transaction", ex);
+                        } finally {
+                            fatal(e);
                         }
-                    } catch (Exception ex) {
-                        log.error("Failed to rollback transaction", ex);
                     }
-                    fatal(e);
                     needAnotherRound = false;
                 }
-            } while (needAnotherRound);
+                // Defensive: stop once the sink is no longer OPEN, e.g. fatal() was called from
+                // another thread during this round, for the same reason as the check above. The
+                // records left in the queue are failed by close().
+            } while (needAnotherRound && state.get() == State.OPEN);
         } finally {
             // Always release the flag, even if an Error escaped the inner try, otherwise the
             // sink would be permanently stuck in the flushing state.
@@ -543,7 +553,12 @@ public abstract class JdbcAbstractSink<T> implements Sink<T> {
     private void internalFlush(Deque<Record<T>> swapList) throws SQLException {
         if (jdbcSinkConfig.isUseTransactions()) {
             connection.commit();
-            swapList.forEach(Record::ack);
+            // Remove each record before acking it, so that if ack() throws, flush() fails only the
+            // records that were not acked yet
+            Record<T> record;
+            while ((record = swapList.pollFirst()) != null) {
+                record.ack();
+            }
         }
     }
 
@@ -584,12 +599,47 @@ public abstract class JdbcAbstractSink<T> implements Sink<T> {
             if (useTransactions) {
                 connection.rollback();
             }
-            for (int r: results) {
-                swapList.removeFirst().fail();
-            }
+            // Keep failing when Record.fail() throws, so that the SQLException below is reported
+            failRecords(swapList, results.length, "of the failed JDBC batch");
             String msg = "Batch failed, got error results (error_code->count): " + failuresMapping;
-            // throwing an exception here means the main loop cycle will nack the messages in the next batch
+            // flush() catches this, fails the remaining records of this round and calls fatal()
             throw new SQLException(msg);
+        }
+    }
+
+    /**
+     * Remove all the records from {@code records} and fail each of them, see
+     * {@link #failRecords(Queue, int, String)}.
+     */
+    private void failRecords(Queue<Record<T>> records, String description) {
+        failRecords(records, Integer.MAX_VALUE, description);
+    }
+
+    /**
+     * Remove up to {@code limit} records from the head of {@code records} and fail each of them.
+     * Record.fail() may throw (the Pulsar source's fail function always throws under
+     * EFFECTIVELY_ONCE): the remaining records are still failed, and one warning with the first
+     * exception and the number of failing fail() calls is logged at the end. A record is removed
+     * before it is failed, so it is never failed twice.
+     *
+     * @param description completes the warning, e.g. "queued while closing the sink"
+     */
+    private void failRecords(Queue<Record<T>> records, int limit, String description) {
+        int failErrors = 0;
+        RuntimeException firstFailError = null;
+        Record<T> record;
+        for (int i = 0; i < limit && (record = records.poll()) != null; i++) {
+            try {
+                record.fail();
+            } catch (RuntimeException e) {
+                if (firstFailError == null) {
+                    firstFailError = e;
+                }
+                failErrors++;
+            }
+        }
+        if (firstFailError != null) {
+            log.warn("Record.fail() threw for {} record(s) {}", failErrors, description, firstFailError);
         }
     }
 
