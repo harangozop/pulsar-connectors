@@ -19,14 +19,19 @@
 package org.apache.pulsar.io.jdbc;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.protobuf.ByteString;
+import java.io.IOException;
 import java.sql.PreparedStatement;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Function;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.avro.Schema;
@@ -34,8 +39,10 @@ import org.apache.avro.generic.GenericData;
 import org.apache.pulsar.client.api.schema.GenericObject;
 import org.apache.pulsar.client.api.schema.GenericRecord;
 import org.apache.pulsar.client.api.schema.KeyValueSchema;
+import org.apache.pulsar.client.impl.schema.AutoConsumeSchema;
 import org.apache.pulsar.client.impl.schema.generic.GenericJsonRecord;
 import org.apache.pulsar.common.schema.KeyValue;
+import org.apache.pulsar.common.schema.SchemaInfo;
 import org.apache.pulsar.common.schema.SchemaType;
 import org.apache.pulsar.functions.api.Record;
 import org.apache.pulsar.io.jdbc.JdbcUtils.ColumnId;
@@ -45,6 +52,17 @@ import org.apache.pulsar.io.jdbc.JdbcUtils.ColumnId;
  */
 @Slf4j
 public abstract class BaseJdbcAutoSchemaSink extends JdbcAbstractSink<GenericObject> {
+
+    private static final int MAX_CACHED_JSON_SCHEMAS = 64;
+    private static final ObjectMapper SCHEMA_MAPPER = new ObjectMapper();
+
+    private volatile JsonBinaryFields[] jsonBinaryFieldsCache = new JsonBinaryFields[0];
+    private final Map<String, Set<String>> jsonBinaryFieldsByDefinition = new LinkedHashMap<>(16, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, Set<String>> eldest) {
+            return size() > MAX_CACHED_JSON_SCHEMAS;
+        }
+    };
 
     @Override
     public String generateUpsertQueryStatement() {
@@ -200,7 +218,10 @@ public abstract class BaseJdbcAutoSchemaSink extends JdbcAbstractSink<GenericObj
             if (schemaType.isPrimitive()) {
                 throw new UnsupportedOperationException("Primitive schema is not supported: " + schemaType);
             }
-            recordValueGetter = (key) -> ((GenericRecord) record).getField(key);
+            recordValueGetter = schemaType == SchemaType.JSON ? createJsonValueGetter(message, record) : null;
+            if (recordValueGetter == null) {
+                recordValueGetter = (key) -> ((GenericRecord) record).getField(key);
+            }
         }
         String action = message.getProperties().get(ACTION_PROPERTY);
         if (action != null) {
@@ -221,6 +242,134 @@ public abstract class BaseJdbcAutoSchemaSink extends JdbcAbstractSink<GenericObj
             }
         }
         return new Mutation(mutationType, recordValueGetter);
+    }
+
+    private Function<String, Object> createJsonValueGetter(Record<GenericObject> message, GenericObject value) {
+        final org.apache.pulsar.client.api.Schema<?> schema = message.getSchema();
+        if (schema instanceof AutoConsumeSchema
+                || !(value instanceof GenericRecord)
+                || !(value.getNativeObject() instanceof JsonNode)) {
+            return null;
+        }
+        final Set<String> binaryFields = getJsonBinaryFields(message);
+        if (binaryFields == null) {
+            return null;
+        }
+        final GenericRecord record = (GenericRecord) value;
+        final JsonNode jsonNode = (JsonNode) value.getNativeObject();
+        return (key) -> getJsonFieldValue(record, jsonNode, binaryFields, key);
+    }
+
+    /**
+     * Returns the names of the fields that {@code GenericJsonRecord.getField} may read as binary for the schema of
+     * the given record, or {@code null} if the schema definition cannot be parsed. The result is cached per schema
+     * instance (one per topic and schema version) and per schema definition, so that a schema definition is parsed
+     * once instead of once per field read.
+     */
+    @VisibleForTesting
+    Set<String> getJsonBinaryFields(Record<GenericObject> message) {
+        final SchemaInfo schemaInfo = message.getSchema().getSchemaInfo();
+        for (JsonBinaryFields entry : jsonBinaryFieldsCache) {
+            if (entry.schemaInfo() == schemaInfo) {
+                return entry.binaryFields();
+            }
+        }
+        synchronized (jsonBinaryFieldsByDefinition) {
+            final String definition = schemaInfo.getSchemaDefinition();
+            final Set<String> binaryFields;
+            if (jsonBinaryFieldsByDefinition.containsKey(definition)) {
+                binaryFields = jsonBinaryFieldsByDefinition.get(definition);
+            } else {
+                binaryFields = computeJsonBinaryFields(message, schemaInfo, definition);
+                jsonBinaryFieldsByDefinition.put(definition, binaryFields);
+            }
+            final JsonBinaryFields[] cache = jsonBinaryFieldsCache;
+            final int retained = Math.min(cache.length, MAX_CACHED_JSON_SCHEMAS - 1);
+            final JsonBinaryFields[] updated = new JsonBinaryFields[retained + 1];
+            updated[0] = new JsonBinaryFields(schemaInfo, binaryFields);
+            System.arraycopy(cache, 0, updated, 1, retained);
+            jsonBinaryFieldsCache = updated;
+            return binaryFields;
+        }
+    }
+
+    private static Set<String> computeJsonBinaryFields(Record<GenericObject> message, SchemaInfo schemaInfo,
+                                                       String definition) {
+        final String topic = message.getTopicName().orElse(null);
+        try {
+            final Set<String> binaryFields = parseJsonBinaryFields(definition);
+            log.info("Reading fields of JSON records from topic {} with schema {} from the JSON tree, "
+                    + "binary fields: {}", topic, schemaInfo.getName(), binaryFields.size());
+            return binaryFields;
+        } catch (Exception e) {
+            log.warn("Cannot parse JSON schema {} of topic {}, reading fields of its records with "
+                    + "GenericRecord.getField", schemaInfo.getName(), topic, e);
+            return null;
+        }
+    }
+
+    /**
+     * Applies the rule of {@code GenericJsonRecord.isBinaryValue} to every field of the schema.
+     */
+    private static Set<String> parseJsonBinaryFields(String schemaDefinition) throws Exception {
+        final Schema.Parser parser = new Schema.Parser();
+        parser.setValidateDefaults(false);
+        final Schema schema = parser.parse(schemaDefinition);
+        final Set<String> binaryFields = new HashSet<>();
+        for (Schema.Field field : schema.getFields()) {
+            final JsonNode fieldSchema = SCHEMA_MAPPER.readTree(field.schema().toString());
+            for (JsonNode node : fieldSchema) {
+                final JsonNode type = node.get("type");
+                if (type != null && ("bytes".equals(type.asText()) || "byte".equals(type.asText()))) {
+                    binaryFields.add(field.name());
+                    break;
+                }
+            }
+        }
+        return Set.copyOf(binaryFields);
+    }
+
+    /**
+     * Returns the same value as {@code GenericJsonRecord.getField}. Containers and textual values of fields that
+     * may be binary are read with {@code getField}, which decides with the schema the record carries; other values
+     * are read from the JSON tree without parsing the schema definition.
+     */
+    private static Object getJsonFieldValue(GenericRecord record, JsonNode jsonNode, Set<String> binaryFields,
+                                            String fieldName) {
+        final JsonNode fn = jsonNode.get(fieldName);
+        if (fn == null) {
+            return null;
+        }
+        if (fn.isContainerNode()) {
+            return record.getField(fieldName);
+        } else if (fn.isBoolean()) {
+            return fn.asBoolean();
+        } else if (fn.isFloatingPointNumber()) {
+            return fn.asDouble();
+        } else if (fn.isBigInteger()) {
+            if (fn.canConvertToLong()) {
+                return fn.asLong();
+            } else {
+                return fn.asText();
+            }
+        } else if (fn.isNumber()) {
+            return fn.numberValue();
+        } else if (fn.isBinary()) {
+            try {
+                return fn.binaryValue();
+            } catch (IOException e) {
+                return fn.asText();
+            }
+        } else if (fn.isNull()) {
+            return null;
+        } else if (binaryFields.contains(fieldName)) {
+            return record.getField(fieldName);
+        } else {
+            return fn.asText();
+        }
+    }
+
+    private record JsonBinaryFields(SchemaInfo schemaInfo, Set<String> binaryFields) {
     }
 
     private static void setColumnNull(PreparedStatement statement, int index, int type) throws Exception {
